@@ -26,10 +26,17 @@ var CreateDebugSpheres = new System.Action<GameObject, float[], Color[]>((target
 
             UnityEngine.Object.Destroy(sphere.GetComponent<Collider>());
 
+            var renderer = sphere.GetComponent<Renderer>();
+
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            renderer.lightProbeUsage = UnityEngine.Rendering.LightProbeUsage.Off;
+            renderer.reflectionProbeUsage = UnityEngine.Rendering.ReflectionProbeUsage.Off;
+
             if (fresnelMat != null)
             {
                 fresnelMat.color = color;
-                sphere.GetComponent<Renderer>().material = fresnelMat;
+                renderer.material = fresnelMat;
             }
         }
 
@@ -65,8 +72,7 @@ foreach (var bee in bees)
         bee,
         new float[] { 16f, 21f },
         new Color[] {
-            new Color(1f, 1f, 1f, 1f),
-            new Color(0f, 0f, 0f, 0f),
-        }
-    );
+            new Color(1f,1f,1f,1f),
+            new Color(0f,0f,0f,0f)
+        });
 }
