@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Top-Down Vision System</title>
+    <style>
+        :root {
+            --bg: #08131d;
+            --panel: rgba(11, 25, 38, 0.82);
+            --panel-border: rgba(127, 181, 211, 0.26);
+            --text: #edf7ff;
+            --muted: #97afbf;
+            --accent: #80f0d2;
+            --accent-warm: #ffd27a;
+            --danger: #ff7b7b;
+            --grid: rgba(123, 177, 205, 0.13);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            font-family: "Segoe UI", "Malgun Gothic", sans-serif;
+            color: var(--text);
+            background: #07111a;
+        }
+
+        body,
+        main {
+            width: 100%;
+            height: 100%;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            background: #07111a;
+            cursor: grab;
+        }
+
+        canvas.dragging {
+            cursor: grabbing;
+        }
+    </style>
+</head>
+<body>
+    <main>
+        <canvas id="visionCanvas" width="920" height="620" aria-label="탑다운 시야 시뮬레이션"></canvas>
+    </main>
+
+    <script>
+        const canvas = document.getElementById("visionCanvas");
+        const ctx = canvas.getContext("2d");
+
+        const DPR = window.devicePixelRatio || 1;
+        const WORLD = { width: window.innerWidth, height: window.innerHeight };
+        
+        const FOV = Math.PI / 2;
+        const LONG_RAY_COUNT = 121;
+        const OMNI_RAY_COUNT = 140;
+        const OMNI_RADIUS = 200;
+        const VISION_STYLE = {
+            fill: "rgba(95, 209, 255, 0.14)",
+            ray: "rgba(95, 209, 255, 0.14)",
+            guide: "rgba(95, 209, 255, 0.2)"
+        };
+        const OBSTACLE_STYLE = {
+            fill: "rgba(113, 132, 153, 0.95)",
+            stroke: "rgba(215, 236, 249, 0.1)"
+        };
+
+        const player = {
+            x: 160,
+            y: 320,
+            angle: 0,
+            radius: 14,
+            moveSpeed: 180,
+            turnSpeed: 2.5
+        };
+
+        const keys = new Set();
+        const pointer = {
+            active: false,
+            obstacleId: null,
+            offsetX: 0,
+            offsetY: 0
+        };
+
+        const obstacles = [
+            { id: 1, x: 300, y: 120, w: 120, h: 110 },
+            { id: 2, x: 510, y: 82, w: 220, h: 58 },
+            { id: 3, x: 476, y: 250, w: 74, h: 216 },
+            { id: 4, x: 220, y: 420, w: 178, h: 66 },
+            { id: 5, x: 640, y: 360, w: 160, h: 110 }
+        ];
+
+        function resizeCanvas() {
+            WORLD.width = window.innerWidth;
+            WORLD.height = window.innerHeight;
+            canvas.width = WORLD.width * DPR;
+            canvas.height = WORLD.height * DPR;
+            canvas.style.aspectRatio = `${WORLD.width} / ${WORLD.height}`;
+            ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        }
+
+        function normalizeAngle(angle) {
+            let next = angle % (Math.PI * 2);
+            if (next < 0) {
+                next += Math.PI * 2;
+            }
+            return next;
+        }
+
+        function clamp(value, min, max) {
+            return Math.min(Math.max(value, min), max);
+        }
+
+        function getMaxDistance() {
+            return Math.hypot(WORLD.width, WORLD.height);
+        }
+
+        function getSegments() {
+            const segments = [
+                [{ x: 0, y: 0 }, { x: WORLD.width, y: 0 }],
+                [{ x: WORLD.width, y: 0 }, { x: WORLD.width, y: WORLD.height }],
+                [{ x: WORLD.width, y: WORLD.height }, { x: 0, y: WORLD.height }],
+                [{ x: 0, y: WORLD.height }, { x: 0, y: 0 }]
+            ];
+
+            for (const obstacle of obstacles) {
+                const left = obstacle.x;
+                const right = obstacle.x + obstacle.w;
+                const top = obstacle.y;
+                const bottom = obstacle.y + obstacle.h;
+
+                segments.push(
+                    [{ x: left, y: top }, { x: right, y: top }],
+                    [{ x: right, y: top }, { x: right, y: bottom }],
+                    [{ x: right, y: bottom }, { x: left, y: bottom }],
+                    [{ x: left, y: bottom }, { x: left, y: top }]
+                );
+            }
+
+            return segments;
+        }
+
+        function raySegmentIntersection(origin, angle, start, end) {
+            const dx = Math.cos(angle);
+            const dy = Math.sin(angle);
+            const sx = end.x - start.x;
+            const sy = end.y - start.y;
+            const denominator = dx * sy - dy * sx;
+
+            if (Math.abs(denominator) < 0.000001) {
+                return null;
+            }
+
+            const qpx = start.x - origin.x;
+            const qpy = start.y - origin.y;
+            const t = (qpx * sy - qpy * sx) / denominator;
+            const u = (qpx * dy - qpy * dx) / denominator;
+
+            if (t < 0 || u < 0 || u > 1) {
+                return null;
+            }
+
+            return {
+                x: origin.x + dx * t,
+                y: origin.y + dy * t,
+                distance: t
+            };
+        }
+
+        function castSingleRay(angle, segments, maxDistance) {
+            let closest = null;
+
+            for (const [start, end] of segments) {
+                const hit = raySegmentIntersection(player, angle, start, end);
+                if (!hit) {
+                    continue;
+                }
+
+                if (hit.distance > maxDistance) {
+                    continue;
+                }
+
+                if (!closest || hit.distance < closest.distance) {
+                    closest = hit;
+                }
+            }
+
+            if (closest) {
+                return closest;
+            }
+
+            return {
+                x: player.x + Math.cos(angle) * maxDistance,
+                y: player.y + Math.sin(angle) * maxDistance,
+                distance: maxDistance
+            };
+        }
+
+        function castVisionCone() {
+            const segments = getSegments();
+            const rays = [];
+            const maxDistance = getMaxDistance();
+
+            for (let i = 0; i < LONG_RAY_COUNT; i += 1) {
+                const t = i / (LONG_RAY_COUNT - 1);
+                const angle = player.angle - FOV / 2 + t * FOV;
+                rays.push({
+                    angle,
+                    hit: castSingleRay(angle, segments, maxDistance)
+                });
+            }
+
+            return rays;
+        }
+
+        function castOmniVision() {
+            const segments = getSegments();
+            const rays = [];
+
+            for (let i = 0; i < OMNI_RAY_COUNT; i += 1) {
+                const angle = (i / OMNI_RAY_COUNT) * Math.PI * 2;
+                rays.push({
+                    angle,
+                    hit: castSingleRay(angle, segments, OMNI_RADIUS)
+                });
+            }
+
+            return rays;
+        }
+
+        function pointInObstacle(x, y, obstacle) {
+            return (
+                x >= obstacle.x &&
+                x <= obstacle.x + obstacle.w &&
+                y >= obstacle.y &&
+                y <= obstacle.y + obstacle.h
+            );
+        }
+
+        function collidesWithObstacle(x, y) {
+            return obstacles.some((obstacle) => (
+                x + player.radius > obstacle.x &&
+                x - player.radius < obstacle.x + obstacle.w &&
+                y + player.radius > obstacle.y &&
+                y - player.radius < obstacle.y + obstacle.h
+            ));
+        }
+
+        function tryMove(nextX, nextY) {
+            const x = clamp(nextX, player.radius, WORLD.width - player.radius);
+            const y = clamp(nextY, player.radius, WORLD.height - player.radius);
+
+            if (!collidesWithObstacle(x, player.y)) {
+                player.x = x;
+            }
+
+            if (!collidesWithObstacle(player.x, y)) {
+                player.y = y;
+            }
+        }
+
+        function update(dt) {
+            if (keys.has("ArrowLeft")) {
+                player.angle -= player.turnSpeed * dt;
+            }
+
+            if (keys.has("ArrowRight")) {
+                player.angle += player.turnSpeed * dt;
+            }
+
+            player.angle = normalizeAngle(player.angle);
+
+            let movement = 0;
+            if (keys.has("ArrowUp")) {
+                movement += 1;
+            }
+            if (keys.has("ArrowDown")) {
+                movement -= 1;
+            }
+
+            if (movement !== 0) {
+                const distance = movement * player.moveSpeed * dt;
+                const nextX = player.x + Math.cos(player.angle) * distance;
+                const nextY = player.y + Math.sin(player.angle) * distance;
+                tryMove(nextX, nextY);
+            }
+        }
+
+        function drawGrid() {
+            ctx.save();
+            ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--grid");
+            ctx.lineWidth = 1;
+
+            for (let x = 0; x <= WORLD.width; x += 40) {
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, WORLD.height);
+                ctx.stroke();
+            }
+
+            for (let y = 0; y <= WORLD.height; y += 40) {
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(WORLD.width, y);
+                ctx.stroke();
+            }
+
+            ctx.restore();
+        }
+
+        function drawObstacles() {
+            for (const obstacle of obstacles) {
+                ctx.fillStyle = OBSTACLE_STYLE.fill;
+                ctx.strokeStyle = OBSTACLE_STYLE.stroke;
+                ctx.lineWidth = 2;
+                ctx.fillRect(obstacle.x, obstacle.y, obstacle.w, obstacle.h);
+                ctx.strokeRect(obstacle.x, obstacle.y, obstacle.w, obstacle.h);
+            }
+        }
+
+        function drawVision(rays, fillColor, rayStroke, radius, innerRadius = 0) {
+            if (rays.length === 0) {
+                return;
+            }
+
+            ctx.save();
+            ctx.beginPath();
+
+            const firstRay = rays[0];
+            const firstStartDistance = Math.min(innerRadius, firstRay.hit.distance);
+            const firstStartX = player.x + Math.cos(firstRay.angle) * firstStartDistance;
+            const firstStartY = player.y + Math.sin(firstRay.angle) * firstStartDistance;
+            ctx.moveTo(firstStartX, firstStartY);
+
+            for (const ray of rays) {
+                ctx.lineTo(ray.hit.x, ray.hit.y);
+            }
+
+            if (innerRadius > 0) {
+                for (let i = rays.length - 1; i >= 0; i -= 1) {
+                    const ray = rays[i];
+                    const startDistance = Math.min(innerRadius, ray.hit.distance);
+                    ctx.lineTo(
+                        player.x + Math.cos(ray.angle) * startDistance,
+                        player.y + Math.sin(ray.angle) * startDistance
+                    );
+                }
+            } else {
+                ctx.lineTo(player.x, player.y);
+            }
+            ctx.closePath();
+
+            ctx.fillStyle = fillColor;
+            ctx.fill();
+
+            ctx.strokeStyle = rayStroke;
+            ctx.lineWidth = 1;
+            for (let i = 0; i < rays.length; i += 4) {
+                const startDistance = Math.min(innerRadius, rays[i].hit.distance);
+                ctx.beginPath();
+                ctx.moveTo(
+                    player.x + Math.cos(rays[i].angle) * startDistance,
+                    player.y + Math.sin(rays[i].angle) * startDistance
+                );
+                ctx.lineTo(rays[i].hit.x, rays[i].hit.y);
+                ctx.stroke();
+            }
+            ctx.restore();
+        }
+
+        function drawVisionOutline(rays, strokeStyle, innerRadius = 0) {
+            if (rays.length === 0) {
+                return;
+            }
+
+            ctx.save();
+            ctx.beginPath();
+
+            const firstRay = rays[0];
+            const firstStartDistance = Math.min(innerRadius, firstRay.hit.distance);
+            ctx.moveTo(
+                player.x + Math.cos(firstRay.angle) * firstStartDistance,
+                player.y + Math.sin(firstRay.angle) * firstStartDistance
+            );
+
+            for (const ray of rays) {
+                ctx.lineTo(ray.hit.x, ray.hit.y);
+            }
+
+            if (innerRadius > 0) {
+                for (let i = rays.length - 1; i >= 0; i -= 1) {
+                    const ray = rays[i];
+                    const startDistance = Math.min(innerRadius, ray.hit.distance);
+                    ctx.lineTo(
+                        player.x + Math.cos(ray.angle) * startDistance,
+                        player.y + Math.sin(ray.angle) * startDistance
+                    );
+                }
+            } else {
+                ctx.lineTo(player.x, player.y);
+            }
+
+            ctx.closePath();
+            ctx.strokeStyle = strokeStyle;
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        function drawConeEdges(rays, strokeStyle, innerRadius) {
+            if (rays.length === 0) {
+                return;
+            }
+
+            const edgeRays = [rays[0], rays[rays.length - 1]];
+            ctx.save();
+            ctx.strokeStyle = strokeStyle;
+            ctx.lineWidth = 1.5;
+
+            for (const ray of edgeRays) {
+                const startDistance = Math.min(innerRadius, ray.hit.distance);
+                ctx.beginPath();
+                ctx.moveTo(
+                    player.x + Math.cos(ray.angle) * startDistance,
+                    player.y + Math.sin(ray.angle) * startDistance
+                );
+                ctx.lineTo(ray.hit.x, ray.hit.y);
+                ctx.stroke();
+            }
+
+            ctx.restore();
+        }
+
+        function drawPlayer() {
+            ctx.save();
+
+            ctx.fillStyle = "rgba(255, 123, 123, 0.96)";
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, player.radius, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.strokeStyle = "rgba(255, 216, 216, 0.8)";
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(player.x, player.y);
+            ctx.lineTo(
+                player.x + Math.cos(player.angle) * 34,
+                player.y + Math.sin(player.angle) * 34
+            );
+            ctx.stroke();
+
+            ctx.fillStyle = "rgba(255, 255, 255, 0.95)";
+            ctx.beginPath();
+            ctx.arc(player.x, player.y, 3.5, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        function drawRangeGuide() {
+            ctx.save();
+            ctx.lineWidth = 2;
+            ctx.setLineDash([8, 8]);
+            ctx.beginPath();
+            ctx.strokeStyle = VISION_STYLE.guide;
+            ctx.arc(player.x, player.y, getMaxDistance(), player.angle - FOV / 2, player.angle + FOV / 2);
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        function render() {
+            ctx.clearRect(0, 0, WORLD.width, WORLD.height);
+            ctx.fillStyle = "#07111a";
+            ctx.fillRect(0, 0, WORLD.width, WORLD.height);
+
+            const omniRays = castOmniVision();
+            const coneRays = castVisionCone();
+            drawGrid();
+            drawVision(
+                omniRays,
+                VISION_STYLE.fill,
+                VISION_STYLE.ray,
+                OMNI_RADIUS
+            );
+            drawVision(
+                coneRays,
+                VISION_STYLE.fill,
+                VISION_STYLE.ray,
+                getMaxDistance(),
+                OMNI_RADIUS
+            );
+            drawVisionOutline(omniRays, VISION_STYLE.guide);
+            drawConeEdges(coneRays, VISION_STYLE.guide, OMNI_RADIUS);
+            drawRangeGuide();
+            drawObstacles();
+            drawPlayer();
+
+        }
+
+        function toWorldPoint(event) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = WORLD.width / rect.width;
+            const scaleY = WORLD.height / rect.height;
+            return {
+                x: (event.clientX - rect.left) * scaleX,
+                y: (event.clientY - rect.top) * scaleY
+            };
+        }
+
+        function onPointerDown(event) {
+            const point = toWorldPoint(event);
+
+            for (let i = obstacles.length - 1; i >= 0; i -= 1) {
+                const obstacle = obstacles[i];
+                if (!pointInObstacle(point.x, point.y, obstacle)) {
+                    continue;
+                }
+
+                pointer.active = true;
+                pointer.obstacleId = obstacle.id;
+                pointer.offsetX = point.x - obstacle.x;
+                pointer.offsetY = point.y - obstacle.y;
+                canvas.classList.add("dragging");
+                return;
+            }
+        }
+
+        function onPointerMove(event) {
+            if (!pointer.active) {
+                return;
+            }
+
+            const obstacle = obstacles.find((item) => item.id === pointer.obstacleId);
+            if (!obstacle) {
+                return;
+            }
+
+            const point = toWorldPoint(event);
+            obstacle.x = clamp(point.x - pointer.offsetX, 0, WORLD.width - obstacle.w);
+            obstacle.y = clamp(point.y - pointer.offsetY, 0, WORLD.height - obstacle.h);
+        }
+
+        function clearPointer() {
+            pointer.active = false;
+            pointer.obstacleId = null;
+            canvas.classList.remove("dragging");
+        }
+
+        let lastTime = performance.now();
+        function frame(now) {
+            const dt = Math.min((now - lastTime) / 1000, 0.033);
+            lastTime = now;
+            update(dt);
+            render();
+            requestAnimationFrame(frame);
+        }
+
+        window.addEventListener("keydown", (event) => {
+            if (event.key.startsWith("Arrow")) {
+                event.preventDefault();
+                keys.add(event.key);
+            }
+        });
+
+        window.addEventListener("keyup", (event) => {
+            keys.delete(event.key);
+        });
+
+        canvas.addEventListener("pointerdown", onPointerDown);
+        window.addEventListener("pointermove", onPointerMove);
+        window.addEventListener("pointerup", clearPointer);
+        window.addEventListener("pointercancel", clearPointer);
+        window.addEventListener("resize", resizeCanvas);
+
+        resizeCanvas();
+        render();
+        requestAnimationFrame(frame);
+    </script>
+</body>
+</html>
